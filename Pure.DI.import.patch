@@ -1,0 +1,325 @@
+diff --git a/src/Pure.DI.Core/Components/Api.g.cs b/src/Pure.DI.Core/Components/Api.g.cs
+index 382e0b3..1914f3c 100644
+--- a/src/Pure.DI.Core/Components/Api.g.cs
++++ b/src/Pure.DI.Core/Components/Api.g.cs
+@@ -2875,6 +2875,28 @@ namespace Pure.DI
+ #endif
+             ;
+ 
++        /// <summary>
++        /// Declares a dependency that the composition does not build itself: whoever creates the composition supplies it.
++        /// The composition gets a constructor argument of type <c>Func&lt;T&gt;</c>, called on every injection of <typeparamref name="T"/>,
++        /// so the supplier keeps the lifetime and the dependency can come from a composition that itself depends on this one.
++        /// A composition from another assembly bound with <c>Bind().To&lt;TComposition&gt;()</c> gets its imports injected like any constructor argument,
++        /// including the tag, so its <see cref="RootKinds.Exported"/> roots can be used without the setup or the implementations being visible.
++        /// <example>
++        /// <code>
++        /// DI.Setup("Composition")
++        ///     .Import&lt;ILogger&gt;()
++        ///     .Bind().To&lt;Repository&gt;()
++        ///     .Root&lt;IRepository&gt;("Repository", kind: RootKinds.Exported);
++        /// </code>
++        /// </example>
++        /// </summary>
++        /// <typeparam name="T">Imported type.</typeparam>
++        /// <param name="tags">Tags of the imported dependency, in this composition and in the supplier.</param>
++        /// <returns>Configuration interface for fluent chaining.</returns>
++        /// <seealso cref="Arg{T}"/>
++        /// <seealso cref="RootKinds.Exported"/>
++        IConfiguration Import<T>(params object[] tags);
++
+         /// <summary>
+         /// Defines a composition root and generates a property or method based on <see cref="RootKinds"/>.
+         /// <example>
+@@ -6134,6 +6156,12 @@ namespace Pure.DI
+                 return this;
+             }
+ 
++            /// <inheritdoc />
++            public IConfiguration Import<T>(params object[] tags)
++            {
++                return this;
++            }
++
+             /// <inheritdoc />
+             public IConfiguration Root<T>(string name, object tag, RootKinds rootKind)
+ #if NET9_0_OR_GREATER
+diff --git a/src/Pure.DI.Core/Core/ApiInvocationProcessor.cs b/src/Pure.DI.Core/Core/ApiInvocationProcessor.cs
+index 8c7c6d9..60c7b6d 100644
+--- a/src/Pure.DI.Core/Core/ApiInvocationProcessor.cs
++++ b/src/Pure.DI.Core/Core/ApiInvocationProcessor.cs
+@@ -635,6 +635,10 @@ sealed class ApiInvocationProcessor(
+                         VisitArg(invocation, metadataVisitor, semanticModel, ArgKind.Root, invocation, genericName, invocationComments);
+                         break;
+ 
++                    case nameof(IConfiguration.Import):
++                        VisitImport(invocation, metadataVisitor, semanticModel, genericName, invocationComments);
++                        break;
++
+                     case nameof(IConfiguration.Roots):
+                         if (genericName.TypeArgumentList.Arguments is not [{} rootsTypeSyntax]
+                             || semantic.TryGetTypeSymbol<INamedTypeSymbol>(semanticModel, rootsTypeSyntax) is not {} rootsType
+@@ -1243,6 +1247,91 @@ sealed class ApiInvocationProcessor(
+         }
+     }
+ 
++    private void VisitImport(
++        InvocationExpressionSyntax invocation,
++        IMetadataVisitor metadataVisitor,
++        SemanticModel semanticModel,
++        GenericNameSyntax genericName,
++        IReadOnlyCollection<string> importComments)
++    {
++        if (genericName.TypeArgumentList.Arguments is not [{} importTypeSyntax]
++            || semanticModel.Compilation.GetTypeByMetadataName("System.Func`1") is not {} funcType)
++        {
++            NotSupported(invocation);
++            return;
++        }
++
++        var importType = semantic.GetTypeSymbol<ITypeSymbol>(semanticModel, importTypeSyntax);
++        var importFuncType = funcType.Construct(importType);
++        var tags = BuildTags(semanticModel, invocation.ArgumentList.Arguments);
++        var importTag = new MdTag(0, idGenerator.Generate() + "Import" + Names.Salt);
++
++        // The supplier passes a factory as a composition argument
++        metadataVisitor.VisitContract(new MdContract(semanticModel, invocation, importFuncType, ContractKind.Explicit, ImmutableArray.Create(importTag)));
++        metadataVisitor.VisitArg(new MdArg(semanticModel, invocation, importFuncType, GetImportName(importType, tags), ArgKind.Composition, false, importComments, ImportTags: tags));
++
++        // which is called on every injection, so the supplier owns the lifetime
++        var factory = new Lines();
++        factory.AppendLine($"({Names.IContextTypeName} {Names.ContextInstance}) =>");
++        using (factory.CreateBlock())
++        {
++            factory.AppendLine($"{Names.ContextInstance}.{nameof(IContext.Inject)}({importTag.Value.ValueToString()}, out {symbolNames.GetGlobalName(importFuncType)} import);");
++            factory.AppendLine("return import();");
++        }
++
++        var lambda = (ParenthesizedLambdaExpressionSyntax)SyntaxFactory.ParseExpression(factory.ToString());
++        var contextParameter = lambda.ParameterList.Parameters[0];
++        var factoryApiWalker = factoryApiWalkerFactory();
++        factoryApiWalker.Initialize(semanticModel, contextParameter, lambda);
++        factoryApiWalker.Visit(lambda);
++
++        // The lambda is not part of the compilation, so the injected type and tag cannot be inferred from it
++        var resolvers = factoryApiWalker.Meta
++            .Where(meta => meta.Kind == FactoryMetaKind.Resolver)
++            .Select(meta => new MdResolver(
++                semanticModel,
++                meta.Expression,
++                meta.Position,
++                importFuncType,
++                importTag,
++                meta.Expression.ArgumentList.Arguments[1].Expression,
++                ImmutableArray<MdOverride>.Empty))
++            .ToImmutableArray();
++
++        metadataVisitor.VisitContract(new MdContract(semanticModel, invocation, importType, ContractKind.Explicit, tags));
++        metadataVisitor.VisitFactory(
++            new MdFactory(
++                semanticModel,
++                invocation,
++                importType,
++                localVariableRenamingRewriterFactory(),
++                lambda,
++                false,
++                contextParameter,
++                resolvers,
++                ImmutableArray<MdInitializer>.Empty,
++                false));
++    }
++
++    // ILogger, "audit" -> loggerAudit; string -> stringImport
++    private static string GetImportName(ITypeSymbol importType, ImmutableArray<MdTag> tags)
++    {
++        var typeName = importType.Name;
++        if (importType.TypeKind == TypeKind.Interface && typeName.Length > 1 && typeName[0] == 'I' && char.IsUpper(typeName[1]))
++        {
++            typeName = typeName.Substring(1);
++        }
++
++        var tagName = tags.IsDefaultOrEmpty || tags[0].Value is null ? "" : NameFormatter.ToValidIdentifier(tags[0].Value!.ToString().Replace("\"", ""));
++        if (tagName.Length > 0)
++        {
++            tagName = char.ToUpperInvariant(tagName[0]) + tagName.Substring(1);
++        }
++
++        var name = NameFormatter.ToValidIdentifier(char.ToLowerInvariant(typeName[0]) + typeName.Substring(1) + tagName);
++        return SyntaxFacts.GetKeywordKind(name) == SyntaxKind.None ? name : name + "Import";
++    }
++
+     private void VisitFactory(
+         InvocationExpressionSyntax source,
+         IMetadataVisitor metadataVisitor,
+diff --git a/src/Pure.DI.Core/Core/Code/Parts/ParameterizedConstructorBuilder.cs b/src/Pure.DI.Core/Core/Code/Parts/ParameterizedConstructorBuilder.cs
+index 785d406..35e6c53 100644
+--- a/src/Pure.DI.Core/Core/Code/Parts/ParameterizedConstructorBuilder.cs
++++ b/src/Pure.DI.Core/Core/Code/Parts/ParameterizedConstructorBuilder.cs
+@@ -32,7 +32,7 @@ sealed class ParameterizedConstructorBuilder(
+         var classArgs = composition.ClassArgs.GetArgsOfKind(ArgKind.Composition).ToList();
+         var ctorName = codeNameProvider.GetConstructorName(composition.Name.ClassName);
+         var ctorArgs = classArgs
+-            .Select(arg => $"{typeResolver.Resolve(composition.Setup, arg.InstanceType)} {arg.Node.Arg?.Source.ArgName}")
++            .Select(arg => $"{GetImportTagAttribute(arg)}{typeResolver.Resolve(composition.Setup, arg.InstanceType)} {arg.Node.Arg?.Source.ArgName}")
+             .Concat(setupContextArgs.Select(arg => $"{typeResolver.Resolve(composition.Setup, arg.Type)} {arg.Name}"));
+         code.AppendLine($"public {ctorName}({string.Join(", ", ctorArgs)})");
+         using (code.CreateBlock())
+@@ -86,4 +86,10 @@ sealed class ParameterizedConstructorBuilder(
+         membersCounter++;
+         return composition with { MembersCount = membersCounter };
+     }
++
++    // The supplier of a composition from another assembly resolves an import by this tag
++    private static string GetImportTagAttribute(VarDeclaration arg) =>
++        arg.Node.Arg?.Source.ImportTags is { IsDefaultOrEmpty: false } importTags && importTags[0].Value is {} tag
++            ? $"[{Names.TagAttributeName}({tag.ValueToString()})] "
++            : "";
+ }
+diff --git a/src/Pure.DI.Core/Core/Models/MdArg.cs b/src/Pure.DI.Core/Core/Models/MdArg.cs
+index 1b7843c..16d904e 100644
+--- a/src/Pure.DI.Core/Core/Models/MdArg.cs
++++ b/src/Pure.DI.Core/Core/Models/MdArg.cs
+@@ -12,7 +12,8 @@ readonly record struct MdArg(
+     bool IsBuildUpInstance,
+     IReadOnlyCollection<string> Comments,
+     bool IsSetupContext = false,
+-    SetupContextKind SetupContextKind = SetupContextKind.Argument)
++    SetupContextKind SetupContextKind = SetupContextKind.Argument,
++    ImmutableArray<MdTag> ImportTags = default)
+ {
+     public override string ToString() => $"{(Kind == ArgKind.Root ? "RootArg" : "Arg")}<{Type}>(\"{ArgName}\")";
+ }
+diff --git a/src/Pure.DI.Core/Core/Names.cs b/src/Pure.DI.Core/Core/Names.cs
+index 6b1208a..7d7a181 100644
+--- a/src/Pure.DI.Core/Core/Names.cs
++++ b/src/Pure.DI.Core/Core/Names.cs
+@@ -47,6 +47,7 @@ static class Names
+     // Attributes
+     public const string OrdinalAttributeName = $"{ApiNamespace}{nameof(OrdinalAttribute)}";
+     public const string ExportAttributeName = $"{ApiNamespace}{nameof(ExportAttribute)}";
++    public const string TagAttributeName = $"{ApiNamespace}{nameof(TagAttribute)}";
+ 
+     // Types
+     public const string IDisposableTypeName = $"{SystemNamespace}{nameof(IDisposable)}";
+diff --git a/tests/Pure.DI.IntegrationTests/ImportTests.cs b/tests/Pure.DI.IntegrationTests/ImportTests.cs
+new file mode 100644
+index 0000000..ec33945
+--- /dev/null
++++ b/tests/Pure.DI.IntegrationTests/ImportTests.cs
+@@ -0,0 +1,116 @@
++namespace Pure.DI.IntegrationTests;
++
++/// <summary>
++/// Tests related to imports, dependencies supplied by whoever creates the composition.
++/// </summary>
++public class ImportTests
++{
++    [Fact]
++    public async Task ShouldResolveImportOnEveryInjection()
++    {
++        // Given
++
++        // When
++        var result = await """
++                           using System;
++                           using Pure.DI;
++
++                           namespace Sample
++                           {
++                              interface IClock
++                              {
++                                  int Now { get; }
++                              }
++
++                              class Clock: IClock
++                              {
++                                  public Clock(int now) => Now = now;
++
++                                  public int Now { get; }
++                              }
++
++                              class Service
++                              {
++                                  public Service(IClock clock1, IClock clock2) => Name = $"{clock1.Now} {clock2.Now}";
++
++                                  public string Name { get; }
++                              }
++
++                              static class Setup
++                              {
++                                  private static void SetupComposition()
++                                  {
++                                      DI.Setup("Composition")
++                                          .Import<IClock>()
++                                          .Root<Service>("Service");
++                                  }
++                              }
++
++                              public class Program
++                              {
++                                  public static void Main()
++                                  {
++                                      var now = 0;
++                                      var composition = new Composition(clock: () => new Clock(++now));
++                                      Console.WriteLine(composition.Service.Name);
++                                      Console.WriteLine(composition.Service.Name);
++                                  }
++                              }
++                           }
++                           """.RunAsync();
++
++        // Then
++        result.Success.ShouldBeTrue(result);
++        result.StdOut.ShouldBe(["1 2", "3 4"], result);
++    }
++
++    [Fact]
++    public async Task ShouldSupportTaggedImports()
++    {
++        // Given
++
++        // When
++        var result = await """
++                           using System;
++                           using Pure.DI;
++
++                           namespace Sample
++                           {
++                              class Service
++                              {
++                                  public Service([Tag("first")] string first, [Tag("second")] string second, string name) =>
++                                      Name = $"{first} {second} {name}";
++
++                                  public string Name { get; }
++                              }
++
++                              static class Setup
++                              {
++                                  private static void SetupComposition()
++                                  {
++                                      DI.Setup("Composition")
++                                          .Import<string>("first")
++                                          .Import<string>("second")
++                                          .Import<string>()
++                                          .Root<Service>("Service");
++                                  }
++                              }
++
++                              public class Program
++                              {
++                                  public static void Main()
++                                  {
++                                      var composition = new Composition(stringFirst: () => "a", stringSecond: () => "b", stringImport: () => "c");
++                                      Console.WriteLine(composition.Service.Name);
++                                  }
++                              }
++                           }
++                           """.RunAsync();
++
++        // Then
++        result.Success.ShouldBeTrue(result);
++        result.StdOut.ShouldBe(["a b c"], result);
++        result.GeneratedCode.ShouldContain("[global::Pure.DI.TagAttribute(\"first\")] System.Func<string> stringFirst");
++        result.GeneratedCode.ShouldContain("[global::Pure.DI.TagAttribute(\"second\")] System.Func<string> stringSecond");
++    }
++}

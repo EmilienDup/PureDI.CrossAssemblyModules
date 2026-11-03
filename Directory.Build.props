@@ -1,0 +1,12 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
+    <PureDIVersion Condition=" '$(PureDIVersion)' == '' ">[2.5.8-import.3]</PureDIVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Pure.DI" Version="$(PureDIVersion)" PrivateAssets="all" />
+  </ItemGroup>
+</Project>
